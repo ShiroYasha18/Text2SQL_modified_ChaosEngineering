@@ -1,19 +1,17 @@
 import os
 import time
 import random
-import re
-import psutil
-import statistics
+import psycopg2
 from datetime import datetime
 import google.generativeai as genai
-import psycopg2
-from dotenv import load_dotenv
 from testcontainers.postgres import PostgresContainer
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+from dotenv import load_dotenv
+from typing import List, Optional
+import re
+from generate import setup_database, populate_database
 
 
-# Metrics tracking
 @dataclass
 class QueryMetrics:
     prompt: str
@@ -27,7 +25,7 @@ class QueryMetrics:
     timestamp: datetime
 
 
-class DatabaseChaosRunner:
+class NetflixChaosRunner:
     def __init__(self):
         load_dotenv()
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -35,35 +33,27 @@ class DatabaseChaosRunner:
         self.chaos_active = True
 
     def generate_sql_query(self, prompt: str) -> str:
-        structured_prompt = f"""You are a SQL query generator. Respond ONLY with the exact PostgreSQL query, nothing else - no explanations, no markdown, no commentary. The query should end with a semicolon.
+        structured_prompt = f"""You are a SQL query generator for a Netflix-like database. 
+        Respond ONLY with the exact PostgreSQL query, nothing else - no explanations, no markdown formatting, no code blocks.
 
-Schema:
-- customers table: customer_id (PRIMARY KEY), customer_name
-- orders table: order_id (PRIMARY KEY), customer_id (FOREIGN KEY), order_date, total_amount
+        Schema:
+        - users (user_id PRIMARY KEY, name, email, signup_date, country)
+        - subscriptions (subscription_id PRIMARY KEY, user_id FOREIGN KEY, plan_type, status, renewal_date)
+        - movies (movie_id PRIMARY KEY, title, genre, release_year, rating)
+        - viewing_history (history_id PRIMARY KEY, user_id FOREIGN KEY, movie_id FOREIGN KEY, watch_time, duration_watched)
 
-Task: {prompt}"""
+        Task: {prompt}
+        """
 
         model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(
-            structured_prompt,
-            generation_config={
-                "temperature": 0.7,
-                "max_output_tokens": 200,
-            }
-        )
-        return response.text.strip()
+        response = model.generate_content(structured_prompt)
 
-    def simulate_resource_constraints(self):
-        """Simulate high CPU/memory usage"""
-        if random.random() < 0.2:  # 20% chance
-            print("🔥 Simulating high CPU usage...")
-            start_time = time.time()
-            while time.time() - start_time < random.uniform(1, 2):
-                _ = [i * i for i in range(10000)]
-            print("Resource constraint simulation ended")
+        clean_sql = response.text.strip()
+        if clean_sql.startswith("```sql"):
+            clean_sql = re.sub(r'^```sql\s*|\s*```$', '', clean_sql, flags=re.DOTALL)
+        return clean_sql.strip()
 
     def simulate_db_specific_chaos(self, conn):
-        """Simulate database-specific issues"""
         if not self.chaos_active or random.random() > 0.3:
             return None
 
@@ -73,7 +63,7 @@ Task: {prompt}"""
             "kill_connection": "SELECT pg_terminate_backend(pg_backend_pid());",
             "temp_table_stress": """
                 CREATE TEMP TABLE stress_test AS 
-                SELECT generate_series(1,10000) AS id;
+                SELECT generate_series(1,50000) AS id;
                 DROP TABLE stress_test;
             """
         }
@@ -90,27 +80,7 @@ Task: {prompt}"""
 
         return chaos_type
 
-    def simulate_network_issues(self):
-        """Simulate network-related issues"""
-        if not self.chaos_active or random.random() > 0.2:
-            return None
-
-        issues = {
-            "latency": (0.5, 1.5),
-            "timeout": (2.0, 3.0),
-            "partition": (1.0, 2.0)
-        }
-
-        issue_type = random.choice(list(issues.keys()))
-        min_time, max_time = issues[issue_type]
-
-        print(f"🌐 Simulating network {issue_type}...")
-        time.sleep(random.uniform(min_time, max_time))
-        print(f"Network {issue_type} resolved")
-
-        return issue_type
-
-    def execute_query_with_retry(self, conn, sql_query: str, max_retries: int = 3) -> QueryMetrics:
+    def execute_query_with_retry(self, conn, sql_query: str, max_retries: int = 3):
         metrics = QueryMetrics(
             prompt="",
             sql_query=sql_query,
@@ -127,13 +97,9 @@ Task: {prompt}"""
 
         for attempt in range(max_retries):
             try:
-                # Simulate various chaos scenarios
-                self.simulate_resource_constraints()
-                network_issue = self.simulate_network_issues()
                 db_chaos = self.simulate_db_specific_chaos(conn)
-
-                if network_issue or db_chaos:
-                    metrics.chaos_type = network_issue or db_chaos
+                if db_chaos:
+                    metrics.chaos_type = db_chaos
 
                 with conn.cursor() as cursor:
                     cursor.execute(sql_query)
@@ -150,7 +116,7 @@ Task: {prompt}"""
                 metrics.error_type = str(e)
                 metrics.retry_count = attempt + 1
                 print(f"🔄 Retry {attempt + 1}/{max_retries}: {e}")
-                time.sleep(random.uniform(0.1, 0.5) * (attempt + 1))  # Exponential backoff
+                time.sleep(random.uniform(0.1, 0.5) * (attempt + 1))
 
             finally:
                 metrics.execution_time = time.time() - start_time
@@ -158,20 +124,18 @@ Task: {prompt}"""
         return metrics, None
 
     def analyze_metrics(self):
-        """Analyze collected metrics"""
-        if not self.metrics:
-            return "No metrics collected yet."
+        """Analyze the collected metrics"""
+        total_queries = len(self.metrics)
+        successful_queries = sum(1 for m in self.metrics if m.success)
+        avg_execution_time = sum(m.execution_time for m in self.metrics) / total_queries
+        chaos_incidents = sum(1 for m in self.metrics if m.chaos_type is not None)
 
-        analysis = {
-            "total_queries": len(self.metrics),
-            "successful_queries": sum(1 for m in self.metrics if m.success),
-            "avg_execution_time": statistics.mean(m.execution_time for m in self.metrics),
-            "max_execution_time": max(m.execution_time for m in self.metrics),
-            "total_retries": sum(m.retry_count for m in self.metrics),
-            "chaos_incidents": sum(1 for m in self.metrics if m.chaos_type is not None)
+        return {
+            "Total Queries": total_queries,
+            "Success Rate": f"{(successful_queries / total_queries) * 100:.2f}%",
+            "Average Execution Time": f"{avg_execution_time:.3f}s",
+            "Chaos Incidents": chaos_incidents
         }
-
-        return analysis
 
     def run_resilience_test(self):
         with PostgresContainer("postgres:15") as postgres:
@@ -183,20 +147,24 @@ Task: {prompt}"""
                 "password": "test"
             }
 
-            print("🚀 Starting database resilience test...")
+            print("🚀 Starting Netflix-style database resilience test...")
 
-            # Initialize database
             conn = psycopg2.connect(**db_params)
-            self.setup_database(conn)
+
+            # Initialize and populate database
+            print("Setting up database schema...")
+            setup_database(conn)
+            print("Populating database with test data...")
+            populate_database(conn)
 
             test_prompts = [
-                "Find customers with purchases over $500 last month",
-                "Get the customer with the highest total purchase amount",
-                "Find customers with above-average purchase amounts",
-                "Find customers with purchases over $1000 in the last 30 days",
-                "Find top 5 customers by purchase frequency",
-                "Calculate the average order value by customer",
-                "Find customers who haven't made a purchase in the last 15 days"
+                "Find the top 5 most-watched movies in the last month",
+                "List users who watched more than 10 movies last month",
+                "Get users who have never finished a movie",
+                "Find churn risk users (users inactive for last 60 days)",
+                "Calculate the average watch time per genre",
+                "Find the most-watched genre in each country",
+                "Find users who have watched all movies of a particular genre"
             ]
 
             for prompt in test_prompts:
@@ -225,46 +193,7 @@ Task: {prompt}"""
 
             conn.close()
 
-    def setup_database(self, conn):
-        """Initialize database with test data"""
-        with conn.cursor() as cursor:
-            # Create tables
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS customers (
-                    customer_id SERIAL PRIMARY KEY,
-                    customer_name VARCHAR(50)
-                )
-            """)
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    order_id SERIAL PRIMARY KEY,
-                    customer_id INT REFERENCES customers(customer_id),
-                    order_date DATE,
-                    total_amount DECIMAL
-                )
-            """)
-
-            # Insert test data
-            for i in range(1, 21):
-                cursor.execute(
-                    "INSERT INTO customers (customer_name) VALUES (%s)",
-                    (f"Customer {i}",)
-                )
-
-            for _ in range(50):
-                cursor.execute(
-                    """INSERT INTO orders (customer_id, order_date, total_amount)
-                       VALUES (%s, CURRENT_DATE - INTERVAL '1 month' + (random() * INTERVAL '28 days'), %s)""",
-                    (
-                        random.randint(1, 20),
-                        random.uniform(100, 1500)
-                    )
-                )
-
-            conn.commit()
-
 
 if __name__ == "__main__":
-    runner = DatabaseChaosRunner()
+    runner = NetflixChaosRunner()
     runner.run_resilience_test()
